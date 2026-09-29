@@ -2,6 +2,8 @@ package usage
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -351,6 +353,75 @@ func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCodexFetcher_Fetch_SendsChatGPTAccountID is a regression for the
+// unscoped /wham/usage read. Omitting ChatGPT-Account-Id makes the API
+// report a higher used_percent than the account's own window. The account
+// id is the access token's chatgpt_account_id claim, and an explicit option
+// overrides it. The reported used_percent is kept as the API sent it.
+func TestCodexFetcher_Fetch_SendsChatGPTAccountID(t *testing.T) {
+	const fromToken = "acct-from-token"
+	token := codexTestJWT(t, fromToken)
+
+	var gotHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("ChatGPT-Account-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":43,"reset_at":1791046703,"limit_window_seconds":604800}}}`)
+	}))
+	defer server.Close()
+
+	fetcher := NewCodexFetcher()
+	fetcher.baseURL = server.URL
+
+	info, err := fetcher.Fetch(context.Background(), token)
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if gotHeader != fromToken {
+		t.Fatalf("ChatGPT-Account-Id = %q, want %q", gotHeader, fromToken)
+	}
+	if info.AccountID != fromToken {
+		t.Fatalf("AccountID = %q, want %q", info.AccountID, fromToken)
+	}
+	if info.PrimaryWindow == nil || info.PrimaryWindow.UsedPercent != 43 {
+		t.Fatalf("primary = %+v, want 43%%", info.PrimaryWindow)
+	}
+
+	info, err = fetcher.FetchWithOptions(context.Background(), token, &CodexFetchOptions{AccountID: "  override  "})
+	if err != nil {
+		t.Fatalf("FetchWithOptions() error = %v", err)
+	}
+	if gotHeader != "override" {
+		t.Fatalf("explicit ChatGPT-Account-Id = %q, want override", gotHeader)
+	}
+	if info.AccountID != "override" {
+		t.Fatalf("AccountID = %q, want override", info.AccountID)
+	}
+
+	gotHeader = "stale"
+	if _, err := fetcher.Fetch(context.Background(), "opaque-token"); err != nil {
+		t.Fatalf("Fetch(opaque) error = %v", err)
+	}
+	if gotHeader != "" {
+		t.Fatalf("opaque token sent ChatGPT-Account-Id %q", gotHeader)
+	}
+}
+
+func codexTestJWT(t *testing.T, accountID string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload, err := json.Marshal(map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": accountID,
+			"user_id":            "user-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 }
 
 // TestClaudeFetcher_Fetch_PercentScaling is a regression test for issue #52.

@@ -98,6 +98,29 @@ func TestExtractFromJWT_UnknownClaims(t *testing.T) {
 	}
 }
 
+func TestChatGPTAccountID(t *testing.T) {
+	token := buildJWT(t, map[string]interface{}{
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_account_id": "  acct-1  ",
+			"user_id":            "uid-456",
+		},
+	})
+	if got := ChatGPTAccountID(token); got != "acct-1" {
+		t.Fatalf("ChatGPTAccountID = %q, want acct-1", got)
+	}
+	if got := ChatGPTAccountID("not-a-jwt"); got != "" {
+		t.Fatalf("ChatGPTAccountID(malformed) = %q, want empty", got)
+	}
+	missing := buildJWT(t, map[string]interface{}{
+		"https://api.openai.com/auth": map[string]interface{}{
+			"user_id": "uid-456",
+		},
+	})
+	if got := ChatGPTAccountID(missing); got != "" {
+		t.Fatalf("ChatGPTAccountID(missing) = %q, want empty", got)
+	}
+}
+
 func TestExtractFromJWT_NestedOpenAIClaims(t *testing.T) {
 	// Simulates a real Codex/OpenAI JWT where plan type is nested under
 	// the "https://api.openai.com/auth" namespace claim.

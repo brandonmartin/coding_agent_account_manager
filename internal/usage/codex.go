@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // Codex API constants.
@@ -128,8 +130,13 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	req.Header.Set("User-Agent", CodexUserAgent)
 	req.Header.Set("Accept", "application/json")
 
-	if opts != nil && opts.AccountID != "" {
-		req.Header.Set("ChatGPT-Account-Id", opts.AccountID)
+	// /wham/usage returns a different used_percent when this header is missing.
+	// The same token then reports an unscoped aggregate instead of the
+	// account's own window (observed 86% versus 43% used). Callers pass only
+	// the access token; the account id is the chatgpt_account_id claim.
+	accountID := codexAccountID(accessToken, opts)
+	if accountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", accountID)
 	}
 
 	resp, err := f.client.Do(req)
@@ -146,6 +153,7 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 		Provider:  "codex",
 		Source:    SourceAPI,
 		FetchedAt: time.Now(),
+		AccountID: accountID,
 	}
 
 	switch resp.StatusCode {
@@ -203,6 +211,17 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	}
 
 	return info, nil
+}
+
+// codexAccountID is the ChatGPT account a usage read must name. An explicit
+// option wins; otherwise the id is taken from the access token.
+func codexAccountID(accessToken string, opts *CodexFetchOptions) string {
+	if opts != nil {
+		if id := strings.TrimSpace(opts.AccountID); id != "" {
+			return id
+		}
+	}
+	return identity.ChatGPTAccountID(accessToken)
 }
 
 // resolveUsageURL determines the correct usage API URL.
