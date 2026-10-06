@@ -1223,6 +1223,17 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		}
 	}
 
+	// Every Cursor file is optional, but cursor-agent rewrites cli-config.json
+	// (model choice, caches) and settings.json all the time, so with them in
+	// the comparison the live login stopped matching its own snapshot within
+	// hours and `caam status cursor` reported no matching profile. The
+	// credential file identifies the login on its own whenever it exists.
+	if fileSet.Tool == "cursor" {
+		if hash, ok := currentHashes["auth.json"]; ok {
+			currentHashes = map[string]string{"auth.json": hash}
+		}
+	}
+
 	if len(currentHashes) == 0 {
 		return "", nil // No relevant auth files present
 	}
