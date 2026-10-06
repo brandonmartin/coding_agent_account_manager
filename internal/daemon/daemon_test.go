@@ -526,14 +526,15 @@ func TestDaemon_CheckProfile_ExpiringToken(t *testing.T) {
 	d.ctx, d.cancel = context.WithCancel(context.Background())
 	defer d.cancel()
 
-	// This will attempt to refresh, but fail because there's no actual profile
-	// The important thing is that it exercises the code path
+	// Claude's own CLI renews its credential, so caam never attempts a
+	// refresh: the profile is skipped, which is neither a refresh nor a
+	// failure.
 	d.checkProfile("claude", "test")
 
 	stats := d.GetStats()
-	// Should have recorded an error (refresh fails because profile doesn't exist in vault)
-	if stats.RefreshErrors != 1 {
-		t.Errorf("RefreshErrors should be 1, got %d", stats.RefreshErrors)
+	if stats.RefreshErrors != 0 || stats.RefreshCount != 0 {
+		t.Errorf("RefreshErrors/RefreshCount should be 0/0 for a skipped claude profile, got %d/%d",
+			stats.RefreshErrors, stats.RefreshCount)
 	}
 }
 

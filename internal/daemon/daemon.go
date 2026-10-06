@@ -85,6 +85,19 @@ type Daemon struct {
 	running bool
 	stats   Stats
 
+	// noteMu guards the two maps below. They keep the daemon from repeating,
+	// every check interval, a line that only needs saying once.
+	noteMu sync.Mutex
+	// unrefreshable holds "provider/profile" keys caam never refreshes (the
+	// provider's own CLI does, or the refresher reported itself unsupported).
+	// They are skipped silently after their one info line, for the daemon's
+	// lifetime; restart the daemon after fixing what made them unsupported.
+	unrefreshable map[string]struct{}
+	// liveNewerNoted holds keys already told that the live login is newer than
+	// the vault copy. Unlike unrefreshable it never blocks a later attempt:
+	// once the vault catches up, refreshing resumes.
+	liveNewerNoted map[string]struct{}
+
 	configMu sync.RWMutex // Protects config access during runtime reloads
 }
 
@@ -606,7 +619,9 @@ func (d *Daemon) checkAndRefresh() {
 		d.logger.Println("Checking profiles for refresh...")
 	}
 
-	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	// Only providers whose vault credentials carry a parseable expiry. The
+	// others (opencode, cursor, grok) have nothing for the daemon to time.
+	providers := []string{"claude", "codex", "gemini"}
 	var totalChecked int64
 
 	// Use a semaphore to limit concurrency
@@ -662,6 +677,13 @@ func (d *Daemon) checkProfile(provider, profile string) {
 		return
 	}
 
+	// Decide whether caam can refresh this profile BEFORE saying it is
+	// refreshing: an unsupported or spent-token profile must never be logged
+	// as a refresh in progress.
+	if !d.canRefresh(provider, profile) {
+		return
+	}
+
 	ttl := time.Until(ph.TokenExpiresAt)
 	d.logger.Printf("%s/%s: refreshing token (expires in %v)", provider, profile, ttl.Round(time.Minute))
 
@@ -670,25 +692,111 @@ func (d *Daemon) checkProfile(provider, profile string) {
 
 	err := refresh.RefreshProfile(ctx, provider, profile, d.vault, d.healthStore)
 
-	d.mu.Lock()
 	if err != nil {
-		d.stats.RefreshErrors++
-		d.mu.Unlock()
-
-		// Don't log unsupported errors as failures
 		var unsupErr *refresh.UnsupportedError
-		if ok := isUnsupportedError(err, &unsupErr); ok {
-			if d.isVerbose() {
-				d.logger.Printf("%s/%s: refresh not supported (%s)", provider, profile, unsupErr.Reason)
-			}
-		} else {
+		switch {
+		case isUnsupportedError(err, &unsupErr):
+			// Not a failure: the refresher itself declined (for example a
+			// Gemini profile without OAuth client credentials).
+			d.noteNotRefreshed(provider, profile, unsupErr.Reason)
+		case errors.Is(err, refresh.ErrLiveCredentialNewer):
+			d.noteLiveNewer(provider, profile, err)
+		default:
+			d.mu.Lock()
+			d.stats.RefreshErrors++
+			d.mu.Unlock()
 			d.logger.Printf("%s/%s: refresh failed: %v", provider, profile, err)
 		}
-	} else {
-		d.stats.RefreshCount++
-		d.mu.Unlock()
-		d.logger.Printf("%s/%s: token refreshed successfully", provider, profile)
+		return
 	}
+
+	d.mu.Lock()
+	d.stats.RefreshCount++
+	d.mu.Unlock()
+	if info := d.parseVaultExpiry(provider, profile); info != nil && !info.ExpiresAt.IsZero() {
+		d.logger.Printf("%s/%s: token refreshed successfully (new expiry %s, in %v)",
+			provider, profile, info.ExpiresAt.Format(time.RFC3339), time.Until(info.ExpiresAt).Round(time.Minute))
+	} else {
+		d.logger.Printf("%s/%s: token refreshed successfully (new expiry unknown)", provider, profile)
+	}
+}
+
+// canRefresh reports whether a refresh attempt for provider/profile should go
+// ahead. When it should not, it logs why (once per profile) and returns false.
+func (d *Daemon) canRefresh(provider, profile string) bool {
+	key := provider + "/" + profile
+	d.noteMu.Lock()
+	_, skip := d.unrefreshable[key]
+	d.noteMu.Unlock()
+	if skip {
+		return false
+	}
+
+	// The provider's own CLI renews a self-refreshing credential in place;
+	// caam must stay out of its way.
+	if info := d.parseVaultExpiry(provider, profile); info != nil && info.SelfRefreshing {
+		d.noteNotRefreshed(provider, profile, "")
+		return false
+	}
+
+	err := refresh.Preflight(provider, profile, d.vault)
+	if err == nil {
+		return true
+	}
+	var unsupErr *refresh.UnsupportedError
+	switch {
+	case isUnsupportedError(err, &unsupErr):
+		d.noteNotRefreshed(provider, profile, unsupErr.Reason)
+		return false
+	case errors.Is(err, refresh.ErrLiveCredentialNewer):
+		d.noteLiveNewer(provider, profile, err)
+		return false
+	default:
+		return true
+	}
+}
+
+// noteNotRefreshed marks provider/profile as never refreshed by caam and logs
+// that once at info. The wording names the provider's CLI when one renews the
+// credential; reason is used otherwise.
+func (d *Daemon) noteNotRefreshed(provider, profile, reason string) {
+	key := provider + "/" + profile
+	d.noteMu.Lock()
+	if d.unrefreshable == nil {
+		d.unrefreshable = make(map[string]struct{})
+	}
+	_, seen := d.unrefreshable[key]
+	d.unrefreshable[key] = struct{}{}
+	d.noteMu.Unlock()
+	if seen {
+		return
+	}
+
+	why := reason
+	if cli := refresh.ProviderCLI(provider); cli != "" {
+		why = fmt.Sprintf("the %s CLI renews it when it runs", cli)
+	}
+	if why == "" {
+		why = "the provider's own CLI renews it when it runs"
+	}
+	d.logger.Printf("%s/%s: not refreshed by caam (%s)", provider, profile, why)
+}
+
+// noteLiveNewer logs once per profile that the vault refresh was skipped
+// because the live login already rotated its refresh token.
+func (d *Daemon) noteLiveNewer(provider, profile string, err error) {
+	key := provider + "/" + profile
+	d.noteMu.Lock()
+	if d.liveNewerNoted == nil {
+		d.liveNewerNoted = make(map[string]struct{})
+	}
+	_, seen := d.liveNewerNoted[key]
+	d.liveNewerNoted[key] = struct{}{}
+	d.noteMu.Unlock()
+	if seen {
+		return
+	}
+	d.logger.Printf("%s/%s: vault refresh skipped: %v", provider, profile, err)
 }
 
 // getProfileHealth returns the health data for a profile.
@@ -702,6 +810,21 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 	}
 
 	// Fall back to parsing the auth files directly
+	expiryInfo := d.parseVaultExpiry(provider, profile)
+	if expiryInfo == nil {
+		return nil
+	}
+
+	return &health.ProfileHealth{
+		TokenExpiresAt: expiryInfo.ExpiresAt,
+		SelfRefreshing: expiryInfo.SelfRefreshing,
+		TokenRenewable: expiryInfo.Renewable,
+	}
+}
+
+// parseVaultExpiry parses the vault copy of a profile's credential. It returns
+// nil when the provider has no expiry parser or the files cannot be read.
+func (d *Daemon) parseVaultExpiry(provider, profile string) *health.ExpiryInfo {
 	vaultPath := d.vault.ProfilePath(provider, profile)
 	var expiryInfo *health.ExpiryInfo
 	var err error
@@ -715,18 +838,15 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor", "grok":
-		// No token expiry parsing for these providers yet
+	default:
+		// No token expiry parsing for opencode, cursor or grok yet.
 		return nil
 	}
 
-	if err != nil || expiryInfo == nil {
+	if err != nil {
 		return nil
 	}
-
-	return &health.ProfileHealth{
-		TokenExpiresAt: expiryInfo.ExpiresAt,
-	}
+	return expiryInfo
 }
 
 // isUnsupportedError checks if an error is an UnsupportedError.

@@ -322,3 +322,27 @@ func TestResnapshotOutgoing(t *testing.T) {
 		}
 	})
 }
+
+// TestCodexLiveAuthPath_HonorsCodexHome covers the exported helpers the daemon
+// uses to apply the freshness guard outside the restore path.
+func TestCodexLiveAuthPath_HonorsCodexHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	if got, want := CodexLiveAuthPath(), filepath.Join(home, "auth.json"); got != want {
+		t.Errorf("CodexLiveAuthPath() = %q, want %q", got, want)
+	}
+
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	live := filepath.Join(dir, "live.json")
+	snap := filepath.Join(dir, "snap.json")
+	writeCodexAuth(t, snap, "alice@example.com", base, &base)
+	newer := base.Add(time.Hour)
+	writeCodexAuth(t, live, "alice@example.com", newer, &newer)
+	if !CodexLiveIsNewer(live, snap) {
+		t.Error("CodexLiveIsNewer = false for a strictly newer same-account live login")
+	}
+	if CodexLiveIsNewer(snap, live) {
+		t.Error("CodexLiveIsNewer = true when the live file is the older one")
+	}
+}

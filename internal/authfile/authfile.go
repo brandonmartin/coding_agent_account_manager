@@ -2204,6 +2204,24 @@ func codexLiveIsNewer(livePath, snapshotPath string) bool {
 	return liveTS.After(snapTS)
 }
 
+// CodexLiveIsNewer is the exported form of codexLiveIsNewer for callers that
+// refresh a vault copy outside the restore path (the daemon, the TUI): when it
+// reports true the vault snapshot at snapshotPath holds a refresh token the
+// live Codex CLI has already rotated, and replaying it gets refresh_token_reused.
+func CodexLiveIsNewer(livePath, snapshotPath string) bool {
+	return codexLiveIsNewer(livePath, snapshotPath)
+}
+
+// CodexLiveAuthPath returns the live Codex auth file ($CODEX_HOME/auth.json,
+// default ~/.codex/auth.json).
+func CodexLiveAuthPath() string {
+	files := CodexAuthFiles().Files
+	if len(files) == 0 {
+		return ""
+	}
+	return files[0].Path
+}
+
 // Claude account identity (issue #73).
 //
 // Claude Code rotates BOTH tokens in ~/.claude/.credentials.json in place

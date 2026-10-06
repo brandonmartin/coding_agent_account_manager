@@ -38,6 +38,13 @@ func ShouldRefresh(h *health.ProfileHealth, threshold time.Duration) bool {
 
 // RefreshProfile orchestrates the refresh for a specific provider/profile.
 func RefreshProfile(ctx context.Context, provider, profile string, vault *authfile.Vault, store *health.Storage) error {
+	// Refuse before touching anything when a refresh cannot or must not run:
+	// an unsupported provider, or a Codex vault copy whose refresh token the
+	// live CLI has already rotated (replaying it gets refresh_token_reused).
+	if err := Preflight(provider, profile, vault); err != nil {
+		return err
+	}
+
 	// Check if this profile is currently active before we modify the vault
 	// (which would change the hash and break ActiveProfile detection).
 	//
@@ -75,8 +82,8 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 	case "gemini":
 		err = refreshGemini(ctx, provider, profile, store, vaultPath)
 	case "opencode", "cursor":
-		// Token refresh not yet supported for these providers
-		return nil
+		// Preflight rejects these; never report a refresh that did not happen.
+		return unsupportedProviderError(provider)
 	default:
 		return &UnsupportedError{Provider: provider, Reason: "provider not supported"}
 	}
@@ -149,6 +156,10 @@ func refreshClaude(ctx context.Context, vaultPath string) error {
 	// Users should re-authenticate via the /login command when tokens expire.
 	//
 	// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-006)
+	return claudeUnsupportedError()
+}
+
+func claudeUnsupportedError() *UnsupportedError {
 	return &UnsupportedError{
 		Provider: "claude",
 		Reason:   "token refresh disabled; Claude Code handles refresh internally. Use /login to re-authenticate.",
