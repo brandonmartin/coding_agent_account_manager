@@ -247,7 +247,9 @@ func sanitizeProviderText(_ string) string {
 }
 
 // parseGrokBilling turns an `_x.ai/billing` result into UsageInfo.
-// Missing or non-numeric usage fields leave the percentage unknown.
+// Non-numeric usage fields leave the percentage unknown. Usage fields that
+// are absent from an otherwise well-formed current period read as 0% (proto3
+// JSON omits zeros); without a valid period they stay unknown.
 func parseGrokBilling(raw []byte, now time.Time) *UsageInfo {
 	info := &UsageInfo{
 		Provider:    "grok",
@@ -349,6 +351,19 @@ func parseGrokBilling(raw []byte, now time.Time) *UsageInfo {
 		}
 	}
 
+	if measured == nil && grokUsageOmitted(cfg) {
+		// _x.ai/billing is proto3 JSON, which leaves out scalar fields whose
+		// value is zero. Right after a period resets, creditUsagePercent is 0,
+		// so the key is absent. When the rest of the message is well formed
+		// (a current period whose start is before its end, and now falls
+		// inside it), that absence means 0% used. A key that is present but
+		// malformed is never read as zero.
+		start := parseProviderTime(bill.PeriodStart)
+		if !start.IsZero() && reset.After(start) && !info.FetchedAt.Before(start) && info.FetchedAt.Before(reset) {
+			measured = percentWindow(0, reset, bill.PeriodType, bill.PeriodStart, bill.PeriodEnd)
+		}
+	}
+
 	if measured != nil {
 		info.PrimaryWindow = measured
 		info.QuotaStatus = QuotaOK
@@ -369,6 +384,18 @@ func parseGrokBilling(raw []byte, now time.Time) *UsageInfo {
 		}
 	}
 	return info
+}
+
+// grokUsageOmitted reports whether the config carries no usage figure at all:
+// neither creditUsagePercent nor used appears under any spelling, not even as
+// null. That is how proto3 JSON encodes both being zero.
+func grokUsageOmitted(cfg map[string]json.RawMessage) bool {
+	for _, k := range []string{"creditUsagePercent", "credit_usage_percent", "used"} {
+		if _, ok := cfg[k]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 func percentWindow(pct float64, reset time.Time, periodType, start, end string) *UsageWindow {
