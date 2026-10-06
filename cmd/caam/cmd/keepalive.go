@@ -99,11 +99,13 @@ func runKeepalive(cmd *cobra.Command, args []string) error {
 	}
 	jsonOut, _ := cmd.Flags().GetBool("json")
 	fail := func(err error) error {
+		// Runtime failures and refusals are not usage errors; the message is
+		// the whole story.
+		cmd.SilenceUsage = true
 		if jsonOut {
 			enc := json.NewEncoder(cmd.OutOrStdout())
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(map[string]any{"ok": false, "error": err.Error()})
-			cmd.SilenceUsage = true
 			cmd.SilenceErrors = true
 		}
 		return err
