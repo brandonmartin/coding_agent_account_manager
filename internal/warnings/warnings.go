@@ -76,7 +76,7 @@ func (c *Checker) CheckAll(ctx context.Context) []Warning {
 	var warnings []Warning
 
 	// Check vault profiles (auth file swapping)
-	for _, tool := range []string{"codex", "claude", "gemini"} {
+	for _, tool := range []string{"codex", "claude", "gemini", "cursor"} {
 		profiles, err := c.vault.List(tool)
 		if err != nil {
 			continue
@@ -103,6 +103,7 @@ func (c *Checker) CheckActive(ctx context.Context) []Warning {
 		"codex":  authfile.CodexAuthFiles,
 		"claude": authfile.ClaudeAuthFiles,
 		"gemini": authfile.GeminiAuthFiles,
+		"cursor": authfile.CursorAuthFiles,
 	}
 
 	for tool, getFileSet := range tools {
@@ -115,6 +116,15 @@ func (c *Checker) CheckActive(ctx context.Context) []Warning {
 
 		// Find active profile
 		activeProfile, err := c.vault.ActiveProfile(fileSet)
+
+		// Cursor's live auth.json is the login that lapses. Matching it to
+		// a vault profile can fail (cli-config.json, hashed alongside it,
+		// is rewritten on every model change), so read the live file.
+		if tool == "cursor" {
+			warnings = append(warnings, c.checkLiveCursor(activeProfile)...)
+			continue
+		}
+
 		if err != nil || activeProfile == "" {
 			continue
 		}
@@ -146,8 +156,10 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor":
-		// No token expiry parsing for these providers yet
+	case "cursor":
+		expInfo, err = health.ParseCursorVaultExpiry(vaultPath)
+	case "opencode":
+		// No token expiry parsing for this provider yet
 		return warnings
 	}
 
@@ -165,6 +177,13 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 
 	// Check expiry
 	remaining := time.Until(expInfo.ExpiresAt)
+
+	// A credential that only a new login renews (a Cursor session, ~60
+	// days) warns ReloginLead ahead and points at a login: "caam refresh"
+	// cannot renew it, and an hour's notice is too late to log in again.
+	if expInfo.ReloginLead > 0 && !expInfo.Renewable {
+		return append(warnings, c.reloginWarnings(tool, profileName, remaining, expInfo.ReloginLead)...)
+	}
 
 	if remaining <= 0 {
 		// Token expired. A credential that carries a refresh token is not a
@@ -210,6 +229,65 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 	}
 
 	return warnings
+}
+
+// cursorLiveExpiry parses the live Cursor login. Tests replace it.
+var cursorLiveExpiry = func() (*health.ExpiryInfo, error) {
+	return health.ParseCursorExpiry("")
+}
+
+// checkLiveCursor warns about the live Cursor login. profileName labels the
+// warning when the live login matched a vault profile.
+func (c *Checker) checkLiveCursor(profileName string) []Warning {
+	info, err := cursorLiveExpiry()
+	if err != nil || info == nil || info.ExpiresAt.IsZero() || info.Renewable || info.ReloginLead <= 0 {
+		return nil
+	}
+	label := profileName
+	if label == "" {
+		label = "live login"
+	}
+	warns := c.reloginWarnings("cursor", label, time.Until(info.ExpiresAt), info.ReloginLead)
+	if profileName == "" {
+		for i := range warns {
+			warns[i].Action = "cursor-agent login"
+		}
+	}
+	return warns
+}
+
+// reloginWarnings reports a credential that cannot be refreshed: critical
+// once it has expired or is inside the critical threshold, a warning inside
+// its relogin lead, nothing before that.
+func (c *Checker) reloginWarnings(tool, profileName string, remaining, lead time.Duration) []Warning {
+	action := fmt.Sprintf("caam login %s %s", tool, profileName)
+	switch {
+	case remaining <= 0:
+		return []Warning{{
+			Level:   LevelCritical,
+			Tool:    tool,
+			Profile: profileName,
+			Message: "Login EXPIRED (cannot be refreshed)",
+			Action:  action,
+		}}
+	case remaining <= c.CriticalThreshold:
+		return []Warning{{
+			Level:   LevelCritical,
+			Tool:    tool,
+			Profile: profileName,
+			Message: fmt.Sprintf("Login expires in %s (cannot be refreshed)", formatDuration(remaining)),
+			Action:  action,
+		}}
+	case remaining <= lead || remaining <= c.WarningThreshold:
+		return []Warning{{
+			Level:   LevelWarning,
+			Tool:    tool,
+			Profile: profileName,
+			Message: fmt.Sprintf("Login expires in %s (cannot be refreshed)", formatDuration(remaining)),
+			Action:  action,
+		}}
+	}
+	return nil
 }
 
 // formatDuration formats a duration in a human-friendly way.

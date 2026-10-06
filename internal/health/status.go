@@ -197,6 +197,11 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 			ttl := h.TokenExpiresAt.Sub(now)
 			criticalTTL := time.Duration(config.TokenExpiryCriticalMinutes) * time.Minute
 			warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
+			if h.ReloginLead > warningTTL {
+				// A long-lived credential that only a new login renews (a
+				// Cursor session) must warn days ahead, not an hour ahead.
+				warningTTL = h.ReloginLead
+			}
 			if criticalTTL > 0 && ttl <= criticalTTL {
 				status = StatusCritical
 			} else if warningTTL > 0 && ttl <= warningTTL {

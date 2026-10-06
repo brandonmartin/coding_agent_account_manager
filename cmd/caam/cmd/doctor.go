@@ -973,6 +973,11 @@ func checkAuthFiles() []CheckResult {
 						Message: "token expired",
 						Details: fmt.Sprintf("Expired at %s; re-login with 'caam login %s %s'", ph.TokenExpiresAt.Format(time.RFC3339), tool, profileName),
 					})
+				} else if ph.ReloginLead > 0 && !ph.CredentialRenewable() {
+					// A login caam cannot refresh (a Cursor session, ~60
+					// days): show the time left, and warn a ReloginLead
+					// ahead so there is time to log in again.
+					results = append(results, reloginCheck(name, tool, profileName, ph))
 				} else if time.Until(ph.TokenExpiresAt) < 15*time.Minute {
 					results = append(results, CheckResult{
 						Name:    name,
@@ -1002,6 +1007,26 @@ func checkAuthFiles() []CheckResult {
 	}
 
 	return results
+}
+
+// reloginCheck reports a credential that only a new login renews: a warning
+// inside its relogin window, otherwise a pass that shows the time left.
+func reloginCheck(name, tool, profileName string, ph *health.ProfileHealth) CheckResult {
+	expires := ph.TokenExpiresAt.Format(time.RFC3339)
+	if ph.ReloginDue(time.Now()) {
+		return CheckResult{
+			Name:    name,
+			Status:  "warn",
+			Message: fmt.Sprintf("login expires %s and cannot be refreshed", formatExpiryDuration(ph.TokenExpiresAt)),
+			Details: fmt.Sprintf("Expires at %s; log in again before then with 'caam login %s %s'", expires, tool, profileName),
+		}
+	}
+	return CheckResult{
+		Name:    name,
+		Status:  "pass",
+		Message: fmt.Sprintf("login valid, expires %s", formatExpiryDuration(ph.TokenExpiresAt)),
+		Details: fmt.Sprintf("Expires at %s; cannot be refreshed, so log in again before then", expires),
+	}
 }
 
 // normalizeIdentity extracts the primary identifier from an identity string

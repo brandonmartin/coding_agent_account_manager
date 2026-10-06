@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -326,6 +327,10 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		// which the Codex parser cannot read; without its own case every Grok
 		// profile scored as unknown-expiry and stuck at warning (issue #101).
 		expInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "cursor":
+		// Without a parser every Cursor profile scored as unknown-expiry and
+		// nothing warned before the ~60-day session login lapsed.
+		expInfo, err = health.ParseCursorVaultExpiry(vaultPath)
 	}
 
 	// Prefer the profile's own live credential over the vault snapshot.
@@ -356,6 +361,23 @@ func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
 	ph.SelfRefreshing = info.SelfRefreshing
 	ph.TokenRenewable = info.Renewable
 	ph.CredentialFingerprint = info.Fingerprint
+	ph.ReloginLead = info.ReloginLead
+}
+
+// cursorProfileAuthPath is where cursor-agent keeps auth.json inside a caam
+// profile. The cursor provider pins XDG_CONFIG_HOME, CURSOR_CONFIG_DIR and
+// APPDATA to cursor-agent's own defaults under the profile HOME, so the
+// defaults for that HOME are the answer. Older layouts kept the file in
+// <home>/.cursor, which is used when the resolved file is missing.
+func cursorProfileAuthPath(home string) string {
+	path := authfile.ResolveCursorPaths(home, runtime.GOOS, func(string) string { return "" }).AuthFile
+	if _, err := os.Stat(path); err != nil {
+		legacy := filepath.Join(home, ".cursor", "auth.json")
+		if _, legacyErr := os.Stat(legacy); legacyErr == nil {
+			return legacy
+		}
+	}
+	return path
 }
 
 // liveAuthExpiry parses token expiry from the tool's live (in-use) auth
@@ -379,6 +401,8 @@ func liveAuthExpiry(tool string) *health.ExpiryInfo {
 			return nil
 		}
 		info, err = health.ParseGrokExpiry(filepath.Join(home, ".grok", "auth.json"))
+	case "cursor":
+		info, err = health.ParseCursorExpiry("")
 	default:
 		return nil
 	}
@@ -438,6 +462,8 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
 	case "grok":
 		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
+	case "cursor":
+		info, err = health.ParseCursorExpiry(cursorProfileAuthPath(prof.HomePath()))
 	default:
 		return nil
 	}

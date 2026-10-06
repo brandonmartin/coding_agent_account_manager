@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
@@ -66,6 +67,13 @@ type ExpiryInfo struct {
 	// Every provider sets it from HasRefreshToken; a self-refreshing
 	// credential is renewable by construction.
 	Renewable bool
+
+	// ReloginLead is how long before ExpiresAt a credential that cannot be
+	// renewed without a human should start warning. Zero keeps the default
+	// thresholds, which suit short-lived tokens (an hour, a day). A Cursor
+	// session login lasts about 60 days and cannot refresh itself, so a
+	// one-hour warning would arrive too late to log in again in time.
+	ReloginLead time.Duration
 
 	// Fingerprint identifies the credential that was parsed (see
 	// CodexCredentialFingerprint). Empty for providers that do not record
@@ -498,6 +506,101 @@ func parseGrokAuthJSON(data []byte) (*ExpiryInfo, error) {
 		return nil, ErrNoExpiry
 	}
 	return best, nil
+}
+
+// CursorSessionReloginLead is how long before a Cursor session login expires
+// caam starts warning about it. A session login lasts about 60 days and
+// cursor-agent does not renew it, so the operator needs days, not minutes,
+// to log in again.
+const CursorSessionReloginLead = 7 * 24 * time.Hour
+
+// cursorAuthJSON is cursor-agent's file-backed credential store
+// (auth.json). Session logins (browser/device flow) write accessToken and
+// refreshToken; an API-key login also keeps apiKey.
+type cursorAuthJSON struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	APIKey       string `json:"apiKey"`
+}
+
+// ParseCursorExpiry extracts the login expiry from cursor-agent's auth.json.
+// An empty authPath means the current user's live file, resolved the way
+// cursor-agent resolves it (authfile.ResolveCursorPaths: Linux
+// $XDG_CONFIG_HOME/cursor/auth.json, macOS ~/.cursor/auth.json, Windows
+// %APPDATA%\Cursor\auth.json).
+//
+//	{"accessToken": "<jwt>", "refreshToken": "<jwt>", "apiKey": "..."}
+//
+// ExpiresAt is the exp claim of accessToken. For a session login both
+// tokens are the same ~60-day session JWT, and cursor-agent only uses the
+// access token while it is unexpired: it has no refresh grant for session
+// logins, so when exp passes it clears the credentials and the profile
+// needs a new login. Such a credential is therefore not Renewable, whatever
+// refreshToken holds, and carries ReloginLead so warnings start
+// CursorSessionReloginLead ahead.
+//
+// A stored apiKey is Renewable: cursor-agent re-runs the key exchange
+// whenever its token is missing or within five minutes of expiry, so the
+// expiry of the tokens beside it is routine.
+//
+// Without a parser every Cursor profile reported unknown expiry, sat at
+// warning in `caam ls`, and nothing warned before the session lapsed.
+func ParseCursorExpiry(authPath string) (*ExpiryInfo, error) {
+	if authPath == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		authPath = authfile.ResolveCursorPaths(homeDir, runtime.GOOS, os.Getenv).AuthFile
+	}
+
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNoAuthFile
+		}
+		return nil, err
+	}
+
+	info, err := parseCursorAuthJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	info.Source = authPath
+	return info, nil
+}
+
+// ParseCursorVaultExpiry reads the Cursor credential saved in a caam vault
+// profile directory. The vault keeps it as auth.json; snapshots taken by
+// some earlier builds named it xdg-auth.json, which is the fallback.
+func ParseCursorVaultExpiry(vaultPath string) (*ExpiryInfo, error) {
+	info, err := ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+	if errors.Is(err, ErrNoAuthFile) {
+		return ParseCursorExpiry(filepath.Join(vaultPath, "xdg-auth.json"))
+	}
+	return info, err
+}
+
+// parseCursorAuthJSON extracts expiry info from the contents of a Cursor
+// auth.json.
+func parseCursorAuthJSON(data []byte) (*ExpiryInfo, error) {
+	var auth cursorAuthJSON
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	info := &ExpiryInfo{
+		ExpiresAt:       jwtExpiry(auth.AccessToken),
+		HasRefreshToken: auth.RefreshToken != "",
+		Renewable:       strings.TrimSpace(auth.APIKey) != "",
+	}
+	if !info.Renewable {
+		info.ReloginLead = CursorSessionReloginLead
+	}
+	if info.ExpiresAt.IsZero() && !info.Renewable {
+		return nil, ErrNoExpiry
+	}
+	return info, nil
 }
 
 // ParseGeminiExpiry extracts token expiry from Gemini CLI auth files.

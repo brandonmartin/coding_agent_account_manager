@@ -97,6 +97,10 @@ type Daemon struct {
 	// the vault copy. Unlike unrefreshable it never blocks a later attempt:
 	// once the vault catches up, refreshing resumes.
 	liveNewerNoted map[string]struct{}
+	// reloginWarned holds, per key, the expiry of the login a relogin
+	// warning was last logged for, so each login is warned about once
+	// rather than on every check, and a new login is warned about afresh.
+	reloginWarned map[string]time.Time
 
 	configMu sync.RWMutex // Protects config access during runtime reloads
 }
@@ -668,6 +672,14 @@ func (d *Daemon) checkProfile(provider, profile string) {
 		return
 	}
 
+	// A credential that only a new login renews (a Cursor session) gives
+	// the refresher nothing to do; the useful signal is a warning ahead of
+	// its expiry.
+	if ph.ReloginLead > 0 && !ph.CredentialRenewable() {
+		d.warnRelogin(provider, profile, ph)
+		return
+	}
+
 	// Check if refresh is needed
 	if !refresh.ShouldRefresh(ph, d.getRefreshThreshold()) {
 		if d.isVerbose() && !ph.TokenExpiresAt.IsZero() {
@@ -799,10 +811,45 @@ func (d *Daemon) noteLiveNewer(provider, profile string, err error) {
 	d.logger.Printf("%s/%s: vault refresh skipped: %v", provider, profile, err)
 }
 
+// warnRelogin logs, once per login, that a credential caam cannot refresh
+// is inside its relogin window or has already expired.
+func (d *Daemon) warnRelogin(provider, profile string, ph *health.ProfileHealth) {
+	now := time.Now()
+	ttl := ph.TokenExpiresAt.Sub(now)
+	if ttl > 0 && !ph.ReloginDue(now) {
+		if d.isVerbose() {
+			d.logger.Printf("%s/%s: login OK (expires in %v)", provider, profile, ttl.Round(time.Minute))
+		}
+		return
+	}
+
+	key := provider + "/" + profile
+	d.noteMu.Lock()
+	if d.reloginWarned == nil {
+		d.reloginWarned = make(map[string]time.Time)
+	}
+	last, seen := d.reloginWarned[key]
+	d.reloginWarned[key] = ph.TokenExpiresAt
+	d.noteMu.Unlock()
+	if seen && last.Equal(ph.TokenExpiresAt) {
+		return
+	}
+
+	if ttl <= 0 {
+		d.logger.Printf("WARNING: %s/%s: login expired at %s and cannot be refreshed; run 'caam login %s %s'",
+			provider, profile, ph.TokenExpiresAt.Format(time.RFC3339), provider, profile)
+		return
+	}
+	d.logger.Printf("WARNING: %s/%s: login expires in %v (%s) and cannot be refreshed; run 'caam login %s %s'",
+		provider, profile, ttl.Round(time.Hour), ph.TokenExpiresAt.Format(time.RFC3339), provider, profile)
+}
+
 // getProfileHealth returns the health data for a profile.
 func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealth {
-	// First try the health store
-	if d.healthStore != nil {
+	// First try the health store. Cursor skips it: its relogin window is a
+	// report-time property the store does not persist, so its expiry always
+	// comes from the vault file.
+	if d.healthStore != nil && provider != "cursor" {
 		ph, err := d.healthStore.GetProfile(provider, profile)
 		if err == nil && ph != nil && !ph.TokenExpiresAt.IsZero() {
 			return ph
@@ -819,6 +866,7 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 		TokenExpiresAt: expiryInfo.ExpiresAt,
 		SelfRefreshing: expiryInfo.SelfRefreshing,
 		TokenRenewable: expiryInfo.Renewable,
+		ReloginLead:    expiryInfo.ReloginLead,
 	}
 }
 
@@ -838,8 +886,10 @@ func (d *Daemon) parseVaultExpiry(provider, profile string) *health.ExpiryInfo {
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
+	case "cursor":
+		expiryInfo, err = health.ParseCursorVaultExpiry(vaultPath)
 	default:
-		// No token expiry parsing for opencode, cursor or grok yet.
+		// No token expiry parsing for opencode or grok yet.
 		return nil
 	}
 

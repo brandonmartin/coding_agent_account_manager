@@ -92,6 +92,23 @@ type ProfileHealth struct {
 	// expiry (it has a Codex refresher), but a lapsed-yet-refreshable token
 	// must not be reported as an expired account (issue #102).
 	TokenRenewable bool `json:"-"`
+
+	// ReloginLead is how long before TokenExpiresAt a credential that is
+	// not renewable starts reporting a warning (see ExpiryInfo.ReloginLead).
+	// Zero keeps the default thresholds. Set at report time alongside
+	// TokenExpiresAt and never persisted.
+	ReloginLead time.Duration `json:"-"`
+}
+
+// ReloginDue reports whether a credential that only a new login can renew
+// is inside its ReloginLead window: still valid, but close enough to
+// expiry that the operator should log in again now.
+func (h *ProfileHealth) ReloginDue(now time.Time) bool {
+	if h == nil || h.ReloginLead <= 0 || h.CredentialRenewable() || h.TokenExpiresAt.IsZero() {
+		return false
+	}
+	ttl := h.TokenExpiresAt.Sub(now)
+	return ttl > 0 && ttl <= h.ReloginLead
 }
 
 // RateLimited reports whether an active rate-limit cooldown is in effect.
