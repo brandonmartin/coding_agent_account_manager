@@ -309,6 +309,20 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 > **Note:** `caam shallow-profile` does not (yet) call any reverse-engineered Anthropic endpoints to display per-account live usage data. That's a separate concern tracked in the original report (issue #16) and intentionally deferred.
 
+#### Keeping idle logins alive: `caam keepalive`
+
+caam refreshes codex and gemini itself (`caam refresh`), but only the provider CLI can renew a Claude or Grok grant. An idle account's access token expires, `caam limits` starts failing, anything routing on it marks it stale, and nothing ever runs the CLI that would renew it. `caam keepalive` breaks that loop. For every **live** grant (each Claude shallow profile; the real-HOME Claude login unless a shallow profile holds the same account; the active Grok login and isolated Grok profiles) whose access token has `--ttl` (default 2h) or less left, it runs the CLI's cheapest self-refreshing call **inside that grant's own HOME**: `claude -p <one word>` on Haiku, or `grok models` (no model turn). Then it re-reads the credential, reports whether it rotated, and copies it into the vault profile of the **same account**, the way `caam backup` would.
+
+```bash
+caam keepalive --dry-run          # what would be pinged / synced
+caam keepalive                    # do it; non-zero exit names any grant that could not be renewed
+caam keepalive --tool grok --json
+caam keepalive --write-systemd ~/.config/systemd/user   # 30-minute user timer (OnCalendar + Persistent)
+systemctl --user daemon-reload && systemctl --user enable --now caam-keepalive.timer
+```
+
+It never pings a vault copy. Refresh tokens are single use: the vault copy of a grant that a live login owns holds a spent token, and replaying it can revoke the whole token family. Naming a vault profile is refused, and so are two live homes on one account. Each grant is locked while it renews, and the CLI's own lock (`.claude/.credentials.lock`, `~/.grok/auth.json.lock`) is taken around the vault copy. Both CLIs renew only a token that is at or near expiry, so pinging a still-valid token is often a no-op. That is reported, not counted as a failure; the next run after expiry renews it.
+
 ---
 
 ## Supported Tools

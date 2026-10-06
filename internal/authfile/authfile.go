@@ -2292,6 +2292,26 @@ func claudeIdentityKeysFromFile(path string) []string {
 	return claudeIdentityKeys(root)
 }
 
+// ClaudeIdentityKeysFromFile returns the namespaced identity keys
+// ("uuid:<accountUuid>", "email:<address>") of the .claude.json at path, or
+// nil when the file is unreadable or carries no identity.
+func ClaudeIdentityKeysFromFile(path string) []string {
+	return claudeIdentityKeysFromFile(path)
+}
+
+// ClaudeProfileIdentityKeys returns the identity keys of a Claude vault
+// profile: its .claude.json snapshot merged with the keys Backup recorded in
+// meta.json, so a profile stays matchable after its snapshot goes missing.
+func (v *Vault) ClaudeProfileIdentityKeys(profile string) []string {
+	return v.claudeProfileIdentityKeys(v.ProfilePath("claude", profile))
+}
+
+// ClaudeIdentityLabel picks the human-facing identity (email, else account
+// uuid) out of a key set returned by the functions above.
+func ClaudeIdentityLabel(keys []string) string {
+	return claudeIdentityLabel(keys)
+}
+
 // claudeIdentityLabel picks the human-facing identity out of a key set:
 // email, else account uuid, else the legacy account string.
 func claudeIdentityLabel(keys []string) string {

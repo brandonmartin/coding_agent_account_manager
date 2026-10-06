@@ -226,6 +226,7 @@ func shouldShowWarnings(cmd *cobra.Command) bool {
 	skipCommands := map[string]bool{
 		"version":    true, // Quick info command
 		"paths":      true, // Quick info command
+		"keepalive":  true, // Reports token expiry itself
 		"validate":   true, // Already doing token validation
 		"doctor":     true, // Already includes validation
 		"help":       true, // Help output only
